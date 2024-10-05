@@ -178,6 +178,10 @@ class Transformer:
     jit=True,
     feed_forward=FeedForward
   ):
+    # set default if this is none.
+    if feed_forward is None:
+      feed_forward = FeedForward
+    
     self.layers = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, max_context, linear, feed_forward=feed_forward) for _ in range(n_layers)]
     self.norm = nn.RMSNorm(dim, norm_eps)
     self.tok_embeddings = nn.Embedding(vocab_size, dim)
