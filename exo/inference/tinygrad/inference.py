@@ -69,7 +69,7 @@ MODEL_PARAMS = {
                 'n_heads': 32,
                 'n_layers': 32,
                 'norm_eps': 1e-5,
-                'vocab_size': 32000,
+                'vocab_size': 32064,
                 'max_context': 2048,
                 'rope_theta': 10000,
                 'n_kv_heads': None,

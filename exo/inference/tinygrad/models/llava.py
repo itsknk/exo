@@ -74,26 +74,65 @@ class LlavaModel:
         # Initialize the language model with the corrected arguments
         self.language_model = LlamaTransformer(**llama_args)
 
+        # **Set n_heads and n_kv_heads as attributes**
+        self.language_model.n_heads = llama_args['n_heads']
+        self.language_model.n_kv_heads = llama_args.get('n_kv_heads') or llama_args['n_heads']
+
         # Initialize the multimodal projector
         self.mm_projector = nn.Linear(vision_config['dim'], llama_args['dim'], bias=False)
 
-    def __call__(self, tokens: Tensor, pixel_values: Optional[Tensor] = None, start_pos: Union[Variable, int] = 0, temperature: float = 0.7, top_k: int = 40, top_p: float = 0.9, alpha_f: float = 0.0, alpha_p: float = 0.0):
+    def __call__(
+        self,
+        tokens: Tensor,
+        pixel_values: Optional[Tensor] = None,
+        start_pos: Union[Variable, int] = 0,
+        temperature: float = 0.7,
+        top_k: int = 40,
+        top_p: float = 0.9,
+        alpha_f: float = 0.0,
+        alpha_p: float = 0.0,
+    ):
         if pixel_values is not None:
             # Get image features from vision model
             vision_output = self.vision_model(pixel_values)  # Shape: (bs, dim)
             image_features = self.mm_projector(vision_output)  # Shape: (bs, dim)
 
-            # Get language model input embeddings
+            # Get token embeddings
             inputs_embeds = self.language_model.tok_embeddings(tokens)  # Shape: (bs, seq_len, dim)
 
             # Identify positions of image tokens
-            image_token_mask = (tokens == self.image_token_id)
-            inputs_embeds = inputs_embeds * (~image_token_mask.unsqueeze(-1)) + image_features.unsqueeze(1) * image_token_mask.unsqueeze(-1)
-        else:
-            inputs_embeds = self.language_model.tok_embeddings(tokens)
+            image_token_mask = (tokens == self.image_token_id).unsqueeze(-1)
+            inputs_embeds = inputs_embeds * (~image_token_mask) + image_features.unsqueeze(1) * image_token_mask
 
-        # Forward through language model
-        logits = self.language_model.forward(inputs_embeds, start_pos, temperature, top_k, top_p, alpha_f, alpha_p)
+            # Forward through language model using `inputs_embeds`
+            logits = self.language_model.forward(
+                inputs_embeds=inputs_embeds,
+                start_pos=start_pos,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                alpha_f=alpha_f,
+                alpha_p=alpha_p,
+            )
+        else:
+            # Directly pass tokens to the language model
+            logits = self.language_model.forward(
+                tokens=tokens,
+                start_pos=start_pos,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                alpha_f=alpha_f,
+                alpha_p=alpha_p,
+            )
+        # Debugging statements
+        print(f"tokens.shape: {tokens.shape}")
+        if pixel_values is not None:
+            print(f"vision_output.shape: {vision_output.shape}")
+            print(f"image_features.shape: {image_features.shape}")
+            print(f"inputs_embeds.shape: {inputs_embeds.shape}")
+        else:
+            print("No pixel_values provided")
         return logits
 
 # Sampling Function (if needed)
@@ -118,8 +157,6 @@ from .llama import convert_from_huggingface
 from tinygrad import Device
 
 def convert_llava_from_huggingface(weights: Dict[str, Tensor], model: LlavaModel):
-    # always print to see things
-    print("Model weight keys:", list(weights.keys())[:100])  # Print first 100 keys for brevity
     # Map the weights from Hugging Face format to tinygrad model
     sd = {}
     for k, v in weights.items():
@@ -136,7 +173,7 @@ def convert_llava_from_huggingface(weights: Dict[str, Tensor], model: LlavaModel
                 {llama_key: v},
                 model.language_model,
                 model.language_model.n_heads,
-                model.language_model.n_kv_heads or model.language_model.n_heads,
+                model.language_model.n_kv_heads,
             )
             # Adjust keys to include 'language_model.'
             sd.update({f"language_model.{k}": val for k, val in llama_sd.items()})

@@ -52,15 +52,21 @@ class Attention:
 
   def __call__(self, x: Tensor, start_pos: Union[Variable, int], freqs_cis: Tensor, mask: Optional[Tensor]) -> Tensor:
     if getenv("WQKV"):
-      if not hasattr(self, 'wqkv'): self.wqkv = Tensor.cat(self.wq.weight, self.wk.weight, self.wv.weight)
-      xqkv = x @ self.wqkv.T
-      xq, xk, xv = xqkv.split([self.wq.weight.shape[0], self.wk.weight.shape[0], self.wv.weight.shape[0]], dim=2)
+        if not hasattr(self, 'wqkv'):
+            self.wqkv = Tensor.cat(self.wq.weight, self.wk.weight, self.wv.weight)
+        xqkv = x @ self.wqkv.T
+        xq, xk, xv = xqkv.split([self.wq.weight.shape[0], self.wk.weight.shape[0], self.wv.weight.shape[0]], dim=2)
     else:
-      xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
+    print(f"x.shape before wq: {x.shape}")
+    print(f"xq.shape after wq: {xq.shape}")
 
     xq = xq.reshape(xq.shape[0], xq.shape[1], self.n_heads, self.head_dim)
     xk = xk.reshape(xk.shape[0], xk.shape[1], self.n_kv_heads, self.head_dim)
     xv = xv.reshape(xv.shape[0], xv.shape[1], self.n_kv_heads, self.head_dim)
+
+    print(f"xq.shape after reshape: {xq.shape}")
 
     xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
     bsz, seqlen, _, _ = xq.shape
@@ -191,31 +197,85 @@ class Transformer:
     self.forward_jit = TinyJit(self.forward) if jit else None
     self.shard = shard
 
-  def forward(self, x: Tensor, start_pos: Union[Variable, int], temperature: float, top_k: int, top_p: float, alpha_f: float, alpha_p: float):
-    seqlen = x.shape[1]
-    freqs_cis = self.freqs_cis.shrink((None, (start_pos, start_pos + seqlen), None, None, None))
-    mask = Tensor.full((1, 1, seqlen, start_pos + seqlen), float("-100000000"), dtype=x.dtype, device=x.device).triu(start_pos + 1).realize() if seqlen > 1 else None
-
+  def forward(
+    self,
+    tokens: Optional[Tensor] = None,
+    inputs_embeds: Optional[Tensor] = None,
+    start_pos: Union[Variable, int] = 0,
+    temperature: float = 0.0,
+    top_k: int = 0,
+    top_p: float = 0.8,
+    alpha_f: float = 0.0,
+    alpha_p: float = 0.0
+):
     if self.shard.is_first_layer():
-      h = self.tok_embeddings(x)
+        if tokens is not None:
+            h = self.tok_embeddings(tokens)
+        elif inputs_embeds is not None:
+            h = inputs_embeds
+        else:
+            raise ValueError("Either tokens or inputs_embeds must be provided")
     else:
-      h = x
+        if inputs_embeds is not None:
+            h = inputs_embeds
+        else:
+            raise ValueError("inputs_embeds must be provided when tokens are not available")
+
+    # Proceed with the rest of the model
+    seqlen = h.shape[1]
+    freqs_cis = self.freqs_cis.shrink((None, (start_pos, start_pos + seqlen), None, None, None))
+    mask = (
+        Tensor.full(
+            (1, 1, seqlen, start_pos + seqlen),
+            float("-100000000"),
+            dtype=h.dtype,
+            device=h.device,
+        )
+        .triu(start_pos + 1)
+        .realize()
+        if seqlen > 1
+        else None
+    )
 
     for i in range(self.shard.start_layer, self.shard.end_layer + 1):
-      layer = self.layers[i]
-      h = layer(h, start_pos, freqs_cis, mask)
+        layer = self.layers[i]
+        h = layer(h, start_pos, freqs_cis, mask)
 
     if self.shard.is_last_layer():
-      logits = self.output(self.norm(h)).float()[:, -1, :]
-      return sample(logits.flatten(), temperature, top_k, top_p, alpha_f, alpha_p).realize()
+        logits = self.output(self.norm(h)).float()[:, -1, :]
+        return sample(logits.flatten(), temperature, top_k, top_p, alpha_f, alpha_p).realize()
     else:
-      return h
+        return h
 
-  def __call__(self, tokens: Tensor, start_pos: Variable, temperature: float = 0.0, top_k: int = 0, top_p: float = 0.8, alpha_f: float = 0.0, alpha_p: float = 0.0):
+
+  def __call__(
+    self,
+    tokens: Optional[Tensor] = None,
+    inputs_embeds: Optional[Tensor] = None,
+    start_pos: Variable = 0,
+    temperature: float = 0.0,
+    top_k: int = 0,
+    top_p: float = 0.8,
+    alpha_f: float = 0.0,
+    alpha_p: float = 0.0
+):
+    if tokens is None and inputs_embeds is None:
+        raise ValueError("Either tokens or inputs_embeds must be provided")
+
     # TODO: better way to handle the first call v.s. the rest?
-    if tokens.shape[0:2] == (1, 1) and self.forward_jit is not None:
-      return self.forward_jit(tokens, Variable("start_pos", 0, self.max_context).bind(start_pos), temperature, top_k, top_p, alpha_f, alpha_p)
-    return self.forward(tokens, start_pos, temperature, top_k, top_p, alpha_f, alpha_p)
+    if tokens is not None and tokens.shape[0:2] == (1, 1) and self.forward_jit is not None:
+        return self.forward_jit(
+            tokens,
+            inputs_embeds,
+            Variable("start_pos", 0, self.max_context).bind(start_pos),
+            temperature,
+            top_k,
+            top_p,
+            alpha_f,
+            alpha_p,
+        )
+    return self.forward(tokens, inputs_embeds, start_pos, temperature, top_k, top_p, alpha_f, alpha_p)
+
 
 
 # *** helpers ***
